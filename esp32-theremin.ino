@@ -8,17 +8,16 @@
 // Line-level audio only. Use 1k + 10 uF into an aux cable.
 
 #include <Arduino.h>
+#include "soc/soc_caps.h"
 #include <math.h>
 
 static const int PIN_PITCH  = 4;
 static const int PIN_VOLUME = 13;
 
-#if defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S2)
+#if defined(SOC_DAC_SUPPORTED) && SOC_DAC_SUPPORTED
   static const int PIN_AUDIO = 25;
-  static const bool USE_DAC  = true;
 #else
   static const int PIN_AUDIO = 17;
-  static const bool USE_DAC  = false;
 #endif
 
 #if defined(CONFIG_IDF_TARGET_ESP32)
@@ -87,25 +86,29 @@ void setup() {
   Serial.println("ESP32 theremin");
   Serial.printf("pitch=GPIO%d  volume=GPIO%d  audio=GPIO%d (%s)\n",
                 PIN_PITCH, PIN_VOLUME, PIN_AUDIO,
-                USE_DAC ? "DAC" : "PWM");
+#if defined(SOC_DAC_SUPPORTED) && SOC_DAC_SUPPORTED
+                "DAC");
+#else
+                "PWM");
+#endif
 
   for (int i = 0; i < SINE_LEN; i++) {
     float th = (2.0f * PI * i) / SINE_LEN;
     sine[i] = (uint8_t)lroundf(127.5f + 127.0f * sinf(th));
   }
 
-  if (USE_DAC) {
-    dacWrite(PIN_AUDIO, 128);
-  } else {
-#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
-    ledcAttach(PIN_AUDIO, 22050, 8);
-    ledcWrite(PIN_AUDIO, 128);
+#if defined(SOC_DAC_SUPPORTED) && SOC_DAC_SUPPORTED
+  dacWrite(PIN_AUDIO, 128);
 #else
-    ledcSetup(0, 22050, 8);
-    ledcAttachPin(PIN_AUDIO, 0);
-    ledcWrite(0, 128);
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+  ledcAttach(PIN_AUDIO, 22050, 8);
+  ledcWrite(PIN_AUDIO, 128);
+#else
+  ledcSetup(0, 22050, 8);
+  ledcAttachPin(PIN_AUDIO, 0);
+  ledcWrite(0, 128);
 #endif
-  }
+#endif
 
   calibrate();
   nextSampleUs = micros();
@@ -156,15 +159,15 @@ void loop() {
     int out = 128 + (int)(((int)sine[idx] - 128) * amp);
     if (out < 0) out = 0;
     if (out > 255) out = 255;
-    if (USE_DAC) {
-      dacWrite(PIN_AUDIO, (uint8_t)out);
-    } else {
-#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
-      ledcWrite(PIN_AUDIO, (uint8_t)out);
+#if defined(SOC_DAC_SUPPORTED) && SOC_DAC_SUPPORTED
+    dacWrite(PIN_AUDIO, (uint8_t)out);
 #else
-      ledcWrite(0, (uint8_t)out);
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    ledcWrite(PIN_AUDIO, (uint8_t)out);
+#else
+    ledcWrite(0, (uint8_t)out);
 #endif
-    }
+#endif
     nowUs = micros();
   }
 }
