@@ -1,25 +1,25 @@
-// S3 WiFi theremin
+// Quick ESP32 theremin
 // Pitch antenna  -> GPIO4
 // Volume antenna -> GPIO13
+// Audio out      -> GPIO25 (DAC on classic ESP32 / S2)
+//                -> GPIO17 PWM on S3 (your board)
 //
-// The S3 makes a WiFi network. Your computer joins it and a browser
-// page plays the tone on the PC speakers. No aux cable.
-//
-// Network:  S3-Theremin
-// Password: theremin
-// Page:     http://192.168.4.1
-// Serial:   115200   type c to recalibrate
+// Serial 115200. Hands away ~1.5 s to calibrate. Type c to recalibrate.
+// Line-level audio only. Use 1k + 10 uF into an aux cable.
 
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WebServer.h>
 #include <math.h>
 
 static const int PIN_PITCH  = 4;
 static const int PIN_VOLUME = 13;
 
-static const char *AP_SSID = "S3-Theremin";
-static const char *AP_PASS = "theremin";
+#if defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S2)
+  static const int PIN_AUDIO = 25;
+  static const bool USE_DAC  = true;
+#else
+  static const int PIN_AUDIO = 17;
+  static const bool USE_DAC  = false;
+#endif
 
 #if defined(CONFIG_IDF_TARGET_ESP32)
   static const bool TOUCH_FALLS_WHEN_NEAR = true;
@@ -27,76 +27,17 @@ static const char *AP_PASS = "theremin";
   static const bool TOUCH_FALLS_WHEN_NEAR = false;
 #endif
 
-static const float FREQ_MIN_HZ = 110.0f;
-static const float FREQ_MAX_HZ = 880.0f;
+static const float FREQ_MIN_HZ   = 110.0f;
+static const float FREQ_MAX_HZ   = 880.0f;
+static const float SAMPLE_HZ     = 16000.0f;
+static const uint32_t SAMPLE_US  = (uint32_t)(1000000.0f / SAMPLE_HZ);
+static const int SINE_BITS       = 8;
+static const int SINE_LEN        = 1 << SINE_BITS;
 
-static float pitchBase = 0;
-static float volBase   = 0;
-static float pitchSpan = 1;
-static float volSpan   = 1;
-static float freqHz    = 0;
-static float amp       = 0;
-
-WebServer server(80);
-
-static const char INDEX_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>S3 Theremin</title>
-<style>
-  body { font-family: sans-serif; background:#111; color:#ddd; text-align:center; margin:2rem; }
-  button { font-size:1.4rem; padding:0.8rem 1.4rem; }
-  #hz { font-size:2.5rem; margin-top:1.2rem; }
-  #hint { color:#888; margin-top:1rem; }
-</style>
-</head>
-<body>
-  <h1>S3 Theremin</h1>
-  <button id="go">Tap to start sound</button>
-  <div id="hz">— Hz</div>
-  <div id="hint">Join WiFi S3-Theremin, then keep this page open.</div>
-<script>
-let ctx, osc, gain, running = false;
-const hzEl = document.getElementById('hz');
-
-document.getElementById('go').onclick = async () => {
-  if (!running) {
-    ctx = new AudioContext();
-    osc = ctx.createOscillator();
-    gain = ctx.createGain();
-    osc.type = 'sine';
-    gain.gain.value = 0;
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start();
-    running = true;
-    document.getElementById('go').textContent = 'Running';
-  }
-  if (ctx.state === 'suspended') await ctx.resume();
-};
-
-async function poll() {
-  try {
-    const r = await fetch('/state');
-    const [f, a] = (await r.text()).split(',').map(Number);
-    hzEl.textContent = (f > 1 ? f.toFixed(1) : '0') + ' Hz';
-    if (running && ctx) {
-      const freq = (f > 1) ? f : 110;
-      const g = (f > 1) ? Math.max(0, Math.min(0.35, a)) : 0;
-      osc.frequency.setTargetAtTime(freq, ctx.currentTime, 0.04);
-      gain.gain.setTargetAtTime(g, ctx.currentTime, 0.04);
-    }
-  } catch (e) {}
-  setTimeout(poll, 40);
-}
-poll();
-</script>
-</body>
-</html>
-)HTML";
+static uint8_t sine[SINE_LEN];
+static float pitchBase = 0, volBase = 0, pitchSpan = 1, volSpan = 1;
+static volatile float freqHz = 0, amp = 0;
+static uint32_t phase = 0, phaseInc = 0, nextSampleUs = 0;
 
 static float mix(float prev, float sample, float alpha) {
   return prev + alpha * (sample - prev);
@@ -139,45 +80,42 @@ static void calibrate() {
   Serial.println("Play.");
 }
 
-static void handleRoot() {
-  server.send_P(200, "text/html", INDEX_HTML);
-}
-
-static void handleState() {
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%.1f,%.3f", freqHz, amp);
-  server.send(200, "text/plain", buf);
-}
-
 void setup() {
   Serial.begin(115200);
-  delay(300);
-  Serial.println();
-  Serial.println("S3 WiFi theremin");
-
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
   delay(200);
-  Serial.print("WiFi: ");
-  Serial.println(AP_SSID);
-  Serial.print("Pass: ");
-  Serial.println(AP_PASS);
-  Serial.print("Open: http://");
-  Serial.println(WiFi.softAPIP());
+  Serial.println();
+  Serial.println("ESP32 theremin");
+  Serial.printf("pitch=GPIO%d  volume=GPIO%d  audio=GPIO%d (%s)\n",
+                PIN_PITCH, PIN_VOLUME, PIN_AUDIO,
+                USE_DAC ? "DAC" : "PWM");
 
-  server.on("/", handleRoot);
-  server.on("/state", handleState);
-  server.begin();
+  for (int i = 0; i < SINE_LEN; i++) {
+    float th = (2.0f * PI * i) / SINE_LEN;
+    sine[i] = (uint8_t)lroundf(127.5f + 127.0f * sinf(th));
+  }
+
+  if (USE_DAC) {
+    dacWrite(PIN_AUDIO, 128);
+  } else {
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    ledcAttach(PIN_AUDIO, 22050, 8);
+    ledcWrite(PIN_AUDIO, 128);
+#else
+    ledcSetup(0, 22050, 8);
+    ledcAttachPin(PIN_AUDIO, 0);
+    ledcWrite(0, 128);
+#endif
+  }
 
   calibrate();
+  nextSampleUs = micros();
 }
 
 void loop() {
-  server.handleClient();
-
   static uint32_t lastSenseMs = 0;
   static float pSmooth = 0, vSmooth = 0;
   uint32_t nowMs = millis();
+
   if (nowMs - lastSenseMs >= 12) {
     lastSenseMs = nowMs;
     float p = proximity(touchNow(PIN_PITCH), pitchBase, pitchSpan);
@@ -193,8 +131,10 @@ void loop() {
       amp = mix(amp, max(0.12f, vSmooth), 0.3f);
     }
 
+    phaseInc = (uint32_t)((freqHz * (float)SINE_LEN / SAMPLE_HZ) * 65536.0f);
+
     static uint32_t lastPrint = 0;
-    if (nowMs - lastPrint >= 250) {
+    if (nowMs - lastPrint >= 200) {
       lastPrint = nowMs;
       Serial.printf("p=%.2f v=%.2f  %6.1f Hz  rawP=%.0f rawV=%.0f\n",
                     pSmooth, vSmooth, freqHz,
@@ -205,5 +145,26 @@ void loop() {
   if (Serial.available()) {
     char c = (char)Serial.read();
     if (c == 'c' || c == 'C') calibrate();
+  }
+
+  uint32_t nowUs = micros();
+  int guard = 0;
+  while ((int32_t)(nowUs - nextSampleUs) >= 0 && guard++ < 16) {
+    nextSampleUs += SAMPLE_US;
+    phase += phaseInc;
+    uint8_t idx = (uint8_t)((phase >> 16) & (SINE_LEN - 1));
+    int out = 128 + (int)(((int)sine[idx] - 128) * amp);
+    if (out < 0) out = 0;
+    if (out > 255) out = 255;
+    if (USE_DAC) {
+      dacWrite(PIN_AUDIO, (uint8_t)out);
+    } else {
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+      ledcWrite(PIN_AUDIO, (uint8_t)out);
+#else
+      ledcWrite(0, (uint8_t)out);
+#endif
+    }
+    nowUs = micros();
   }
 }
